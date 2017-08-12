@@ -52,6 +52,7 @@
 #include "rocksdb/env.h"
 #include "rocksdb/persistent_cache.h"
 #include "rocksdb/rate_limiter.h"
+#include "rocksdb/slice.h"
 #include "rocksdb/slice_transform.h"
 #include "rocksdb/thread_status.h"
 #include "rocksdb/utilities/checkpoint.h"
@@ -1969,6 +1970,9 @@ public:
   virtual rocksdb::Status get(rocksdb::ColumnFamilyHandle *const column_family,
                               const rocksdb::Slice &key,
                               std::string *value) const = 0;
+  virtual rocksdb::Status get(rocksdb::ColumnFamilyHandle *const column_family,
+                              const rocksdb::Slice &key,
+                              rocksdb::PinnableSlice *pinnable_val) const = 0;
   virtual rocksdb::Status
   get_for_update(rocksdb::ColumnFamilyHandle *const column_family,
                  const rocksdb::Slice &key, std::string *const value,
@@ -2239,11 +2243,20 @@ public:
     return m_rocksdb_tx->GetWriteBatch();
   }
 
+  using Rdb_transaction::get;
   rocksdb::Status get(rocksdb::ColumnFamilyHandle *const column_family,
                       const rocksdb::Slice &key,
                       std::string *value) const override {
     global_stats.queries[QUERIES_POINT].inc();
     return m_rocksdb_tx->Get(m_read_opts, column_family, key, value);
+  }
+
+  using Rdb_transaction::get;
+  rocksdb::Status get(rocksdb::ColumnFamilyHandle *const column_family,
+                      const rocksdb::Slice &key,
+                      rocksdb::PinnableSlice *pinnable_val) const override {
+    global_stats.queries[QUERIES_POINT].inc();
+    return m_rocksdb_tx->Get(m_read_opts, column_family, key, pinnable_val);
   }
 
   rocksdb::Status
@@ -2470,11 +2483,22 @@ public:
     return m_batch;
   }
 
+  using Rdb_transaction::get;
   rocksdb::Status get(rocksdb::ColumnFamilyHandle *const column_family,
                       const rocksdb::Slice &key,
                       std::string *const value) const override {
     return m_batch->GetFromBatchAndDB(rdb, m_read_opts, column_family, key,
                                       value);
+  }
+
+  using Rdb_transaction::get;
+  rocksdb::Status get(rocksdb::ColumnFamilyHandle *const column_family,
+                      const rocksdb::Slice &key,
+                      rocksdb::PinnableSlice *pinnable_val) const override {
+    auto s = m_batch->GetFromBatchAndDB(rdb, m_read_opts, column_family, key,
+                                      pinnable_val->GetSelf());
+    pinnable_val->PinSelf();
+    return s;
   }
 
   rocksdb::Status
@@ -7300,12 +7324,14 @@ int ha_rocksdb::get_row_by_rowid(uchar *const buf, const char *const rowid,
     DBUG_RETURN(0);
   }
 
+  rocksdb::PinnableSlice pinnable_val(&m_retrieved_record);
   if (m_lock_rows == RDB_LOCK_NONE) {
     tx->acquire_snapshot(true);
-    s = tx->get(m_pk_descr->get_cf(), key_slice, &m_retrieved_record);
+    s = tx->get(m_pk_descr->get_cf(), key_slice, &pinnable_val);
   } else {
     s = get_for_update(tx, m_pk_descr->get_cf(), key_slice,
                        &m_retrieved_record);
+    pinnable_val.PinSelf();
   }
 
   if (!s.IsNotFound() && !s.ok()) {
@@ -7318,14 +7344,13 @@ int ha_rocksdb::get_row_by_rowid(uchar *const buf, const char *const rowid,
   if (found) {
     /* If we found the record, but it's expired, pretend we didn't find it.  */
     if (!skip_ttl_check && m_pk_descr->has_ttl() &&
-        should_hide_ttl_rec(rocksdb::Slice(&m_retrieved_record.front(),
-                                           m_retrieved_record.size()),
+        should_hide_ttl_rec(pinnable_val,
                             tx->m_snapshot_timestamp)) {
       DBUG_RETURN(HA_ERR_KEY_NOT_FOUND);
     }
 
     m_last_rowkey.copy((const char *)rowid, rowid_size, &my_charset_bin);
-    rc = convert_record_from_storage_format(&key_slice, buf);
+    rc = convert_record_from_storage_format(&key_slice, &pinnable_val, buf);
 
     if (!rc) {
       table->status = 0;
